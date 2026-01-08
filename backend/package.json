@@ -1,8 +1,9 @@
 {
   "name": "zapp-backend",
   "version": "1.0.0",
-  "main": "index.js",
+  "private": true,
   "type": "commonjs",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
