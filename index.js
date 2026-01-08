@@ -4,9 +4,13 @@ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
+// ✅ 新增：JWT + 密码hash（纯JS，不会有 native build 坑）
+const jwt = require("jsonwebtoken");
+const bcrypt = require("bcryptjs");
+const crypto = require("crypto");
+
 // ======================================================
 // 0) Firebase Admin init (ENV Secret first, then default)
-//    - Reads service account JSON from env: FIREBASE_SERVICE_ACCOUNT
 // ======================================================
 function initFirebaseAdmin() {
   const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -23,7 +27,6 @@ function initFirebaseAdmin() {
       return { mode: "cert(serviceAccount)", projectId: serviceAccountObj.project_id || null };
     } catch (e) {
       console.error("❌ FIREBASE_SERVICE_ACCOUNT is not valid JSON, fallback to default:", e);
-      // fallback below
     }
   }
 
@@ -60,9 +63,11 @@ app.get("/", (req, res) => {
       "",
       "Try:",
       "GET  /health",
-      "GET  /me     (need Authorization: Bearer <Firebase ID token>)",
-      "GET  /orders (need Authorization)",
-      "POST /orders (need Authorization)",
+      "POST /signup  (email+password -> JWT token)",
+      "POST /login   (email+password -> JWT token)",
+      "GET  /me     (Authorization: Bearer <JWT or Firebase ID token>)",
+      "GET  /orders (Authorization: Bearer <JWT or Firebase ID token>)",
+      "POST /orders (Authorization: Bearer <JWT or Firebase ID token>)",
     ].join("\n")
   );
 });
@@ -71,35 +76,36 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "zapp-backend",
-    version: "ROOT-INDEX-2026-01-08-FIRESTORE-AUD-AUTO3",
+    version: "ROOT-INDEX-2026-01-08-JWT-LOGIN-ADDON",
     credentialMode: initInfo.mode,
     firebaseProjectIdFromCert: initInfo.projectId,
     hasFirebaseServiceAccountEnv: !!process.env.FIREBASE_SERVICE_ACCOUNT,
+    authProjectId: process.env.AUTH_PROJECT_ID || null,
     time: new Date().toISOString(),
   });
 });
 
 // ======================================================
-// 3) Helper: get Firestore bound to a specific project
-//    - If the service account is from project A but Firestore is in project B,
-//      you MUST point Firestore to the right projectId.
+// 3) Helper: pick Firestore projectId
+// ======================================================
+function pickProjectId(fallbackFromToken) {
+  return (
+    process.env.AUTH_PROJECT_ID ||
+    fallbackFromToken ||
+    initInfo.projectId ||
+    process.env.GCLOUD_PROJECT ||
+    null
+  );
+}
+
+// ======================================================
+// 4) Helper: get Firestore bound to a specific project
 // ======================================================
 function getDbForProject(projectId) {
-  // admin.firestore() uses the app default.
-  // To force project, we can create an App instance per project if needed.
-  // But simplest & robust: use Firestore client options via initializeApp with projectId.
-  //
-  // Since we already initialized default app, we create/reuse a named app
-  // bound to projectId when project mismatch happens.
   const appName = `app-${projectId}`;
-
-  // Reuse if exists
   const existing = admin.apps.find((a) => a.name === appName);
   if (existing) return existing.firestore();
 
-  // Create a new app with same credential but forced projectId
-  // If we used ENV cert => we can reuse the same credential object.
-  // If default creds => still can set projectId; GCP will use ADC.
   const options = {
     credential: admin.app().options.credential,
     projectId,
@@ -110,21 +116,60 @@ function getDbForProject(projectId) {
 }
 
 // ======================================================
-// 4) Auth middleware
-//    - Verify Firebase ID token
-//    - Extract aud as firebaseProjectId
+// 5) JWT helpers
+// ======================================================
+function requireJwtSecret() {
+  const s = process.env.JWT_SECRET;
+  if (!s || s.length < 16) {
+    // 不要把 secret 打印出来
+    throw new Error("Missing JWT_SECRET (set it in Cloud Run env vars, length >= 16 recommended)");
+  }
+  return s;
+}
+
+function signJwt(payload) {
+  const secret = requireJwtSecret();
+  // 7天有效期，你也可以改短一点
+  return jwt.sign(payload, secret, { expiresIn: "7d" });
+}
+
+function verifyJwt(token) {
+  const secret = requireJwtSecret();
+  return jwt.verify(token, secret);
+}
+
+// ======================================================
+// 6) Auth middleware (ACCEPTS: JWT OR Firebase ID token)
 // ======================================================
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
     const m = authHeader.match(/^Bearer (.+)$/);
-
     if (!m) {
       return res.status(401).json({ success: false, message: "Missing Bearer token" });
     }
 
-    const idToken = m[1];
-    const decoded = await admin.auth().verifyIdToken(idToken);
+    const token = m[1];
+
+    // ① 先尝试 JWT（你新加的 /login /signup 会发这个）
+    try {
+      const decodedJwt = verifyJwt(token);
+
+      req.user = {
+        uid: decodedJwt.uid,
+        email: decodedJwt.email || null,
+        name: decodedJwt.name || null,
+      };
+
+      req.firebaseProjectId = pickProjectId(null);
+      req.authType = "jwt";
+      return next();
+    } catch (e) {
+      // 不是 JWT 或 JWT 过期，就继续尝试 Firebase
+    }
+
+    // ② 再尝试 Firebase ID Token（保持兼容）
+    const decoded = await admin.auth().verifyIdToken(token);
 
     req.user = {
       uid: decoded.uid,
@@ -132,9 +177,9 @@ async function requireAuth(req, res, next) {
       name: decoded.name || null,
     };
 
-    // aud usually equals Firebase project id (e.g. test2-authentication-b81c3)
-    req.firebaseProjectId = decoded.aud || null;
-
+    // aud 通常是 firebase projectId
+    req.firebaseProjectId = pickProjectId(decoded.aud || null);
+    req.authType = "firebase";
     return next();
   } catch (err) {
     return res.status(401).json({
@@ -146,15 +191,125 @@ async function requireAuth(req, res, next) {
 }
 
 // ======================================================
-// 5) /me
+// 7) Users store (Firestore)
+//    - Collection: auth_users/{uid}
 // ======================================================
-app.get("/me", requireAuth, (req, res) => {
-  res.json({ success: true, user: req.user, firebaseProjectId: req.firebaseProjectId });
+async function findUserByEmail(db, email) {
+  const snap = await db
+    .collection("auth_users")
+    .where("email", "==", email)
+    .limit(1)
+    .get();
+
+  if (snap.empty) return null;
+  const doc = snap.docs[0];
+  return { uid: doc.id, ...doc.data() };
+}
+
+// ======================================================
+// 8) POST /signup  (email+password -> JWT)
+// ======================================================
+app.post("/signup", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const e = String(email || "").trim().toLowerCase();
+    const p = String(password || "");
+
+    if (!e || !e.includes("@")) {
+      return res.status(400).json({ success: false, message: "Invalid email" });
+    }
+    if (!p || p.length < 6) {
+      return res.status(400).json({ success: false, message: "Password must be at least 6 chars" });
+    }
+
+    const projectId = pickProjectId(null);
+    if (!projectId) {
+      return res.status(500).json({ success: false, message: "Cannot determine Firestore projectId" });
+    }
+    const db = getDbForProject(projectId);
+
+    const existing = await findUserByEmail(db, e);
+    if (existing) {
+      return res.status(409).json({ success: false, message: "Email already registered" });
+    }
+
+    const uid = crypto.randomUUID();
+    const hash = await bcrypt.hash(p, 10);
+
+    await db.collection("auth_users").doc(uid).set({
+      email: e,
+      passwordHash: hash,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    const token = signJwt({ uid, email: e });
+    return res.json({ success: true, token, uid, email: e });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Signup failed",
+      error: String(err?.message || err),
+    });
+  }
 });
 
 // ======================================================
-// 6) Orders API: users/{uid}/orders/{orderId}
-//    - Use Firestore bound to token's aud projectId (most robust)
+// 9) POST /login  (email+password -> JWT)
+// ======================================================
+app.post("/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+    const e = String(email || "").trim().toLowerCase();
+    const p = String(password || "");
+
+    if (!e || !e.includes("@")) {
+      return res.status(400).json({ success: false, message: "Invalid email" });
+    }
+    if (!p) {
+      return res.status(400).json({ success: false, message: "Password required" });
+    }
+
+    const projectId = pickProjectId(null);
+    if (!projectId) {
+      return res.status(500).json({ success: false, message: "Cannot determine Firestore projectId" });
+    }
+    const db = getDbForProject(projectId);
+
+    const user = await findUserByEmail(db, e);
+    if (!user) {
+      return res.status(401).json({ success: false, message: "Invalid email or password" });
+    }
+
+    const ok = await bcrypt.compare(p, user.passwordHash);
+    if (!ok) {
+      return res.status(401).json({ success: false, message: "Invalid email or password" });
+    }
+
+    const token = signJwt({ uid: user.uid, email: e });
+    return res.json({ success: true, token, uid: user.uid, email: e });
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: "Login failed",
+      error: String(err?.message || err),
+    });
+  }
+});
+
+// ======================================================
+// 10) /me
+// ======================================================
+app.get("/me", requireAuth, (req, res) => {
+  res.json({
+    success: true,
+    authType: req.authType,
+    user: req.user,
+    firebaseProjectId: req.firebaseProjectId,
+  });
+});
+
+// ======================================================
+// 11) Orders API: users/{uid}/orders/{orderId}
 // ======================================================
 app.get("/orders", requireAuth, async (req, res) => {
   try {
@@ -164,7 +319,7 @@ app.get("/orders", requireAuth, async (req, res) => {
     if (!projectId) {
       return res.status(400).json({
         success: false,
-        message: "Missing firebase project id (aud) in token",
+        message: "Missing project id for Firestore",
       });
     }
 
@@ -198,7 +353,7 @@ app.post("/orders", requireAuth, async (req, res) => {
     if (!projectId) {
       return res.status(400).json({
         success: false,
-        message: "Missing firebase project id (aud) in token",
+        message: "Missing project id for Firestore",
       });
     }
 
@@ -212,7 +367,6 @@ app.post("/orders", requireAuth, async (req, res) => {
     };
 
     const ref = await db.collection("users").doc(uid).collection("orders").add(order);
-
     res.json({ success: true, orderId: ref.id });
   } catch (err) {
     res.status(500).json({
@@ -224,18 +378,18 @@ app.post("/orders", requireAuth, async (req, res) => {
 });
 
 // ======================================================
-// 7) 404 fallback
+// 12) 404 fallback
 // ======================================================
 app.use((req, res) => {
   res.status(404).json({
     success: false,
     message: `Route not found: ${req.method} ${req.path}`,
-    hint: "Try GET /, GET /health, GET /me (auth), GET/POST /orders (auth)",
+    hint: "Try GET /, GET /health, POST /signup, POST /login, GET /me (auth), GET/POST /orders (auth)",
   });
 });
 
 // ======================================================
-// 8) Cloud Run listen
+// 13) Cloud Run listen
 // ======================================================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
