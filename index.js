@@ -42,12 +42,13 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------
-// 3) Health check
+// 3) Health check（加 version 验证跑的是哪份代码）
 // ----------------------
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "zapp-backend",
+    version: "ROOT-INDEX-2026-01-08-TEST",
     time: new Date().toISOString(),
   });
 });
@@ -85,15 +86,14 @@ async function requireAuth(req, res, next) {
 }
 
 // ----------------------
-// 5) /me
+// 5) /me（需要 token）
 // ----------------------
 app.get("/me", requireAuth, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
 // ----------------------
-// 6) Orders API
-// Firestore: users/{uid}/orders/{orderId}
+// 6) Orders API（users/{uid}/orders/{orderId}）
 // ----------------------
 app.get("/orders", requireAuth, async (req, res) => {
   try {
