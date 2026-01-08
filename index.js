@@ -76,7 +76,7 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "zapp-backend",
-    version: "ROOT-INDEX-2026-01-08-JWT-LOGIN-ADDON",
+    version: "ROOT-INDEX-2026-01-08-JWT-LOGIN-ADDON44",
     credentialMode: initInfo.mode,
     firebaseProjectIdFromCert: initInfo.projectId,
     hasFirebaseServiceAccountEnv: !!process.env.FIREBASE_SERVICE_ACCOUNT,
@@ -393,3 +393,4 @@ app.use((req, res) => {
 // ======================================================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
