@@ -2,20 +2,22 @@ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// ----------------------
+// ======================
 // 0) Firebase Admin init
-// 在 Cloud Run（配了服务账号权限）可以直接 admin.initializeApp()
-// ----------------------
+// Cloud Run 使用服务账号权限即可
+// ======================
 admin.initializeApp();
 const db = admin.firestore();
 
+// ======================
+// 1) App init
+// ======================
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ----------------------
-// 1) CORS（Flutter Web）
-// 作业先用宽松策略，之后再收紧 origin
-// ----------------------
+// ======================
+// 2) CORS（Flutter Web 友好）
+// ======================
 app.use(
   cors({
     origin: true,
@@ -25,23 +27,26 @@ app.use(
   })
 );
 
-// 让预检请求更稳
+// 预检请求
 app.options("*", cors());
 
-// ----------------------
-// 2) Root page (避免 Cannot GET /)
-// ----------------------
+// ======================
+// 3) Root page（避免 Cannot GET /）
+// ======================
 app.get("/", (req, res) => {
-  res
-    .status(200)
-    .send(
-      "zapp-backend is running ✅ Try /health, /me (auth), /orders (auth)."
-    );
+  res.status(200).send(
+    "zapp-backend is running ✅\n\n" +
+      "Available routes:\n" +
+      "GET  /health\n" +
+      "GET  /me        (auth)\n" +
+      "GET  /orders    (auth)\n" +
+      "POST /orders    (auth)\n"
+  );
 });
 
-// ----------------------
-// 3) Health check
-// ----------------------
+// ======================
+// 4) Health check
+// ======================
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
@@ -50,22 +55,22 @@ app.get("/health", (req, res) => {
   });
 });
 
-// ----------------------
-// 4) Auth middleware (verify Firebase ID token)
-// ----------------------
+// ======================
+// 5) Auth middleware
+// ======================
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
-    const m = authHeader.match(/^Bearer (.+)$/);
+    const match = authHeader.match(/^Bearer (.+)$/);
 
-    if (!m) {
-      return res
-        .status(401)
-        .json({ success: false, message: "Missing Bearer token" });
+    if (!match) {
+      return res.status(401).json({
+        success: false,
+        message: "Missing Bearer token",
+      });
     }
 
-    const idToken = m[1];
-    const decoded = await admin.auth().verifyIdToken(idToken);
+    const decoded = await admin.auth().verifyIdToken(match[1]);
 
     req.user = {
       uid: decoded.uid,
@@ -73,30 +78,30 @@ async function requireAuth(req, res, next) {
       name: decoded.name || null,
     };
 
-    return next();
+    next();
   } catch (err) {
-    return res.status(401).json({
+    res.status(401).json({
       success: false,
-      message: "Invalid token",
+      message: "Invalid or expired token",
       error: String(err?.message || err),
     });
   }
 }
 
-// ----------------------
-// 5) /me (你刚才测的接口：需要 token)
-// ----------------------
-app.get("/me", requireAuth, async (req, res) => {
+// ======================
+// 6) /me（测试登录是否成功）
+// ======================
+app.get("/me", requireAuth, (req, res) => {
   res.json({
     success: true,
     user: req.user,
   });
 });
 
-// ----------------------
-// 6) Orders API (demo)
+// ======================
+// 7) Orders API
 // Firestore: users/{uid}/orders/{orderId}
-// ----------------------
+// ======================
 app.get("/orders", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -109,7 +114,10 @@ app.get("/orders", requireAuth, async (req, res) => {
       .limit(50)
       .get();
 
-    const orders = snap.docs.map((d) => ({ id: d.id, ...d.data() }));
+    const orders = snap.docs.map((d) => ({
+      id: d.id,
+      ...d.data(),
+    }));
 
     res.json({ success: true, orders });
   } catch (err) {
@@ -129,8 +137,8 @@ app.post("/orders", requireAuth, async (req, res) => {
     const order = {
       ...body,
       uid,
-      createdAt: admin.firestore.FieldValue.serverTimestamp(),
       status: body.status || "PLACED",
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
     };
 
     const ref = await db
@@ -139,7 +147,10 @@ app.post("/orders", requireAuth, async (req, res) => {
       .collection("orders")
       .add(order);
 
-    res.json({ success: true, orderId: ref.id });
+    res.json({
+      success: true,
+      orderId: ref.id,
+    });
   } catch (err) {
     res.status(500).json({
       success: false,
@@ -149,9 +160,9 @@ app.post("/orders", requireAuth, async (req, res) => {
   }
 });
 
-// ----------------------
-// 7) 404 fallback (更好看一点)
-// ----------------------
+// ======================
+// 8) 404 fallback
+// ======================
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -160,11 +171,11 @@ app.use((req, res) => {
   });
 });
 
-// ----------------------
-// 8) Cloud Run listen
-// ----------------------
+// ======================
+// 9) Cloud Run listen
+// ======================
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
+  console.log(` zapp-backend listening on port ${PORT}`);
 });
 
