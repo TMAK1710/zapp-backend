@@ -3,9 +3,30 @@ const cors = require("cors");
 const admin = require("firebase-admin");
 
 // ----------------------
-// 0) Firebase Admin init
+// 0) Firebase Admin init (FIX: force to test2-authentication-b81c3)
 // ----------------------
-admin.initializeApp();
+function loadServiceAccount() {
+  // 推荐：Cloud Run 用环境变量塞 JSON（更安全、更方便）
+  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
+    const obj = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+    if (obj.private_key && typeof obj.private_key === "string") {
+      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
+    }
+    return obj;
+  }
+
+  // 备选：本地开发/临时用文件（不要提交到 GitHub）
+  // 把你上传的 json 重命名为 serviceAccountKey.json 放到项目根目录
+  // eslint-disable-next-line import/no-dynamic-require
+  return require("./serviceAccountKey.json");
+}
+
+const serviceAccount = loadServiceAccount();
+
+admin.initializeApp({
+  credential: admin.credential.cert(serviceAccount),
+});
+
 const db = admin.firestore();
 
 const app = express();
@@ -25,7 +46,7 @@ app.use(
 app.options("*", cors());
 
 // ----------------------
-// 2) Root page（解决 Cannot GET /）
+// 2) Root page
 // ----------------------
 app.get("/", (req, res) => {
   res.status(200).send(
@@ -42,13 +63,14 @@ app.get("/", (req, res) => {
 });
 
 // ----------------------
-// 3) Health check（加 version 验证跑的是哪份代码）
+// 3) Health check (add firebase project info)
 // ----------------------
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "zapp-backend",
-    version: "ROOT-INDEX-2026-01-08-TEST1",
+    version: "ROOT-INDEX-2026-01-08-TEST2-AUD-FIX",
+    firebase_project: serviceAccount.project_id || null,
     time: new Date().toISOString(),
   });
 });
@@ -86,7 +108,7 @@ async function requireAuth(req, res, next) {
 }
 
 // ----------------------
-// 5) /me（需要 token）
+// 5) /me
 // ----------------------
 app.get("/me", requireAuth, (req, res) => {
   res.json({ success: true, user: req.user });
@@ -162,6 +184,4 @@ app.use((req, res) => {
 // ----------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
-
-
 
