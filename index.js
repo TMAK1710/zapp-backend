@@ -2,42 +2,18 @@ const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
-// ======================
-// 0) Firebase Admin init (IMPORTANT)
-// ======================
-// 推荐方式：用环境变量 FIREBASE_SERVICE_ACCOUNT_JSON（更适合 Cloud Run）
-// 备选方式：本地或构建镜像时放一个 serviceAccountKey.json 在同目录
-function loadServiceAccount() {
-  if (process.env.FIREBASE_SERVICE_ACCOUNT_JSON) {
-    const obj = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
-
-    // Cloud Run 环境变量里常见 "\n" 被转义，需要还原
-    if (obj.private_key && typeof obj.private_key === "string") {
-      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    }
-    return obj;
-  }
-
-  // ⚠️ 如果你不用环境变量，就把你的 key 文件放到项目根目录并命名为 serviceAccountKey.json
-  // （注意：不要提交到 GitHub）
-  // eslint-disable-next-line import/no-dynamic-require
-  return require("./serviceAccountKey.json");
-}
-
-const serviceAccount = loadServiceAccount();
-
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-});
-
+// ----------------------
+// 0) Firebase Admin init
+// ----------------------
+admin.initializeApp();
 const db = admin.firestore();
 
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
-// ======================
+// ----------------------
 // 1) CORS（Flutter Web）
-// ======================
+// ----------------------
 app.use(
   cors({
     origin: true,
@@ -48,9 +24,9 @@ app.use(
 );
 app.options("*", cors());
 
-// ======================
-// 2) Root page
-// ======================
+// ----------------------
+// 2) Root page（解决 Cannot GET /）
+// ----------------------
 app.get("/", (req, res) => {
   res.status(200).send(
     [
@@ -65,22 +41,21 @@ app.get("/", (req, res) => {
   );
 });
 
-// ======================
-// 3) Health check
-// ======================
+// ----------------------
+// 3) Health check（加 version 验证跑的是哪份代码）
+// ----------------------
 app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "zapp-backend",
-    version: "ROOT-INDEX-2026-01-08-AUD-FIX1",
-    project: serviceAccount.project_id || null,
+    version: "ROOT-INDEX-2026-01-08-TEST",
     time: new Date().toISOString(),
   });
 });
 
-// ======================
+// ----------------------
 // 4) Auth middleware
-// ======================
+// ----------------------
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -110,16 +85,16 @@ async function requireAuth(req, res, next) {
   }
 }
 
-// ======================
+// ----------------------
 // 5) /me（需要 token）
-// ======================
+// ----------------------
 app.get("/me", requireAuth, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
-// ======================
+// ----------------------
 // 6) Orders API（users/{uid}/orders/{orderId}）
-// ======================
+// ----------------------
 app.get("/orders", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
@@ -171,9 +146,9 @@ app.post("/orders", requireAuth, async (req, res) => {
   }
 });
 
-// ======================
+// ----------------------
 // 7) 404 fallback
-// ======================
+// ----------------------
 app.use((req, res) => {
   res.status(404).json({
     success: false,
@@ -182,9 +157,10 @@ app.use((req, res) => {
   });
 });
 
-// ======================
+// ----------------------
 // 8) Cloud Run listen
-// ======================
+// ----------------------
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
+
 
