@@ -1,7 +1,42 @@
+"use strict";
+
 const express = require("express");
 const cors = require("cors");
 const admin = require("firebase-admin");
 
+// ======================================================
+// 0) Firebase Admin init (ENV Secret first, then default)
+//    - Reads service account JSON from env: FIREBASE_SERVICE_ACCOUNT
+// ======================================================
+function initFirebaseAdmin() {
+  const sa = process.env.FIREBASE_SERVICE_ACCOUNT;
+
+  if (sa) {
+    try {
+      const serviceAccountObj = JSON.parse(sa);
+
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccountObj),
+      });
+
+      console.log("✅ Firebase Admin initialized with cert from ENV (FIREBASE_SERVICE_ACCOUNT)");
+      return { mode: "cert(serviceAccount)", projectId: serviceAccountObj.project_id || null };
+    } catch (e) {
+      console.error("❌ FIREBASE_SERVICE_ACCOUNT is not valid JSON, fallback to default:", e);
+      // fallback below
+    }
+  }
+
+  admin.initializeApp();
+  console.log("⚠️ Firebase Admin initialized with default application credentials");
+  return { mode: "default(application)", projectId: null };
+}
+
+const initInfo = initFirebaseAdmin();
+
+// ======================================================
+// 1) Express + CORS
+// ======================================================
 const app = express();
 app.use(express.json({ limit: "1mb" }));
 
@@ -15,91 +50,9 @@ app.use(
 );
 app.options("*", cors());
 
-let credentialMode = "unknown";
-let firebaseProjectId = null;
-
-// ----------------------
-// Firebase Admin init (robust, won't crash silently)
-// ----------------------
-function tryLoadServiceAccountFromEnv() {
-  const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-  if (!raw) return null;
-
-  // Cloud Run 环境变量里经常会把换行搞乱，所以这里尽量“宽容”处理
-  // 1) 先直接 parse
-  try {
-    const obj = JSON.parse(raw);
-    if (obj.private_key && typeof obj.private_key === "string") {
-      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    }
-    return obj;
-  } catch (e1) {
-    // 2) 有些人会粘贴成带多余引号的字符串：'"{...}"'
-    try {
-      const trimmed = raw.trim();
-      const unquoted =
-        (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-        (trimmed.startsWith("'") && trimmed.endsWith("'"))
-          ? trimmed.slice(1, -1)
-          : trimmed;
-
-      const obj = JSON.parse(unquoted);
-      if (obj.private_key && typeof obj.private_key === "string") {
-        obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-      }
-      return obj;
-    } catch (e2) {
-      console.error("[FIREBASE] JSON parse failed:", e1?.message || e1);
-      console.error("[FIREBASE] JSON parse failed (retry):", e2?.message || e2);
-      return null;
-    }
-  }
-}
-
-function tryLoadServiceAccountFromFile() {
-  try {
-    // eslint-disable-next-line import/no-dynamic-require
-    const obj = require("./serviceAccountKey.json");
-    if (obj.private_key && typeof obj.private_key === "string") {
-      obj.private_key = obj.private_key.replace(/\\n/g, "\n");
-    }
-    return obj;
-  } catch (e) {
-    console.error("[FIREBASE] serviceAccountKey.json not found or invalid:", e?.message || e);
-    return null;
-  }
-}
-
-try {
-  const sa = tryLoadServiceAccountFromEnv() || tryLoadServiceAccountFromFile();
-
-  if (sa) {
-    admin.initializeApp({ credential: admin.credential.cert(sa) });
-    credentialMode = sa ? "cert(serviceAccount)" : "unknown";
-    firebaseProjectId = sa.project_id || null;
-  } else {
-    // 兜底：让服务先跑起来（/health 能打开），只是 auth 会失败
-    admin.initializeApp();
-    credentialMode = "default(application)";
-    firebaseProjectId = process.env.GCLOUD_PROJECT || null;
-  }
-} catch (e) {
-  console.error("[FIREBASE] initializeApp crashed:", e?.message || e);
-  // 兜底让服务继续跑（不然 Cloud Run 起不来）
-  try {
-    admin.initializeApp();
-    credentialMode = "default(application)-after-crash";
-    firebaseProjectId = process.env.GCLOUD_PROJECT || null;
-  } catch (e2) {
-    console.error("[FIREBASE] fallback initializeApp crashed:", e2?.message || e2);
-  }
-}
-
-const db = admin.firestore();
-
-// ----------------------
-// Routes
-// ----------------------
+// ======================================================
+// 2) Root + Health
+// ======================================================
 app.get("/", (req, res) => {
   res.status(200).send(
     [
@@ -118,16 +71,49 @@ app.get("/health", (req, res) => {
   res.json({
     ok: true,
     service: "zapp-backend",
-    version: "ROOT-INDEX-2026-01-08-TEST2-AUD-FIX-ROBUST",
-    credentialMode,
-    firebaseProjectId,
+    version: "ROOT-INDEX-2026-01-08-FIRESTORE-AUD-AUTO3",
+    credentialMode: initInfo.mode,
+    firebaseProjectIdFromCert: initInfo.projectId,
+    hasFirebaseServiceAccountEnv: !!process.env.FIREBASE_SERVICE_ACCOUNT,
     time: new Date().toISOString(),
   });
 });
 
-// ----------------------
-// Auth middleware
-// ----------------------
+// ======================================================
+// 3) Helper: get Firestore bound to a specific project
+//    - If the service account is from project A but Firestore is in project B,
+//      you MUST point Firestore to the right projectId.
+// ======================================================
+function getDbForProject(projectId) {
+  // admin.firestore() uses the app default.
+  // To force project, we can create an App instance per project if needed.
+  // But simplest & robust: use Firestore client options via initializeApp with projectId.
+  //
+  // Since we already initialized default app, we create/reuse a named app
+  // bound to projectId when project mismatch happens.
+  const appName = `app-${projectId}`;
+
+  // Reuse if exists
+  const existing = admin.apps.find((a) => a.name === appName);
+  if (existing) return existing.firestore();
+
+  // Create a new app with same credential but forced projectId
+  // If we used ENV cert => we can reuse the same credential object.
+  // If default creds => still can set projectId; GCP will use ADC.
+  const options = {
+    credential: admin.app().options.credential,
+    projectId,
+  };
+
+  const newApp = admin.initializeApp(options, appName);
+  return newApp.firestore();
+}
+
+// ======================================================
+// 4) Auth middleware
+//    - Verify Firebase ID token
+//    - Extract aud as firebaseProjectId
+// ======================================================
 async function requireAuth(req, res, next) {
   try {
     const authHeader = req.headers.authorization || "";
@@ -137,7 +123,8 @@ async function requireAuth(req, res, next) {
       return res.status(401).json({ success: false, message: "Missing Bearer token" });
     }
 
-    const decoded = await admin.auth().verifyIdToken(m[1]);
+    const idToken = m[1];
+    const decoded = await admin.auth().verifyIdToken(idToken);
 
     req.user = {
       uid: decoded.uid,
@@ -145,25 +132,43 @@ async function requireAuth(req, res, next) {
       name: decoded.name || null,
     };
 
+    // aud usually equals Firebase project id (e.g. test2-authentication-b81c3)
+    req.firebaseProjectId = decoded.aud || null;
+
     return next();
   } catch (err) {
     return res.status(401).json({
       success: false,
       message: "Invalid or expired token",
       error: String(err?.message || err),
-      credentialMode,
-      firebaseProjectId,
     });
   }
 }
 
+// ======================================================
+// 5) /me
+// ======================================================
 app.get("/me", requireAuth, (req, res) => {
-  res.json({ success: true, user: req.user });
+  res.json({ success: true, user: req.user, firebaseProjectId: req.firebaseProjectId });
 });
 
+// ======================================================
+// 6) Orders API: users/{uid}/orders/{orderId}
+//    - Use Firestore bound to token's aud projectId (most robust)
+// ======================================================
 app.get("/orders", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
+    const projectId = req.firebaseProjectId;
+
+    if (!projectId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing firebase project id (aud) in token",
+      });
+    }
+
+    const db = getDbForProject(projectId);
 
     const snap = await db
       .collection("users")
@@ -188,6 +193,16 @@ app.post("/orders", requireAuth, async (req, res) => {
   try {
     const uid = req.user.uid;
     const body = req.body || {};
+    const projectId = req.firebaseProjectId;
+
+    if (!projectId) {
+      return res.status(400).json({
+        success: false,
+        message: "Missing firebase project id (aud) in token",
+      });
+    }
+
+    const db = getDbForProject(projectId);
 
     const order = {
       ...body,
@@ -197,6 +212,7 @@ app.post("/orders", requireAuth, async (req, res) => {
     };
 
     const ref = await db.collection("users").doc(uid).collection("orders").add(order);
+
     res.json({ success: true, orderId: ref.id });
   } catch (err) {
     res.status(500).json({
@@ -207,16 +223,19 @@ app.post("/orders", requireAuth, async (req, res) => {
   }
 });
 
+// ======================================================
+// 7) 404 fallback
+// ======================================================
 app.use((req, res) => {
   res.status(404).json({
     success: false,
     message: `Route not found: ${req.method} ${req.path}`,
+    hint: "Try GET /, GET /health, GET /me (auth), GET/POST /orders (auth)",
   });
 });
 
-// ----------------------
-// Cloud Run listen (MUST be 0.0.0.0)
-// ----------------------
-const PORT = Number(process.env.PORT || 8080);
-app.listen(PORT, "0.0.0.0", () => console.log(`Server listening on ${PORT}`));
-
+// ======================================================
+// 8) Cloud Run listen
+// ======================================================
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
