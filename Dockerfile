@@ -18,4 +18,5 @@ ENV PORT=8080
 EXPOSE 8080
 
 # 直接跑你的入口文件，避免 npm start 配置不对
-CMD ["node", "index.js"]
+CMD ["node", "backend/index.js"]
+
