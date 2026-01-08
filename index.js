@@ -4,7 +4,6 @@ const admin = require("firebase-admin");
 
 // ----------------------
 // 0) Firebase Admin init
-// Cloud Run 配好服务账号权限后可直接 initializeApp()
 // ----------------------
 admin.initializeApp();
 const db = admin.firestore();
@@ -86,14 +85,15 @@ async function requireAuth(req, res, next) {
 }
 
 // ----------------------
-// 5) /me（需要 token）
+// 5) /me
 // ----------------------
 app.get("/me", requireAuth, (req, res) => {
   res.json({ success: true, user: req.user });
 });
 
 // ----------------------
-// 6) Orders API（users/{uid}/orders/{orderId}）
+// 6) Orders API
+// Firestore: users/{uid}/orders/{orderId}
 // ----------------------
 app.get("/orders", requireAuth, async (req, res) => {
   try {
@@ -161,8 +161,5 @@ app.use((req, res) => {
 // 8) Cloud Run listen
 // ----------------------
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, () => {
-  console.log(`Server listening on ${PORT}`);
-});
-
+app.listen(PORT, () => console.log(`Server listening on ${PORT}`));
 
